@@ -1,0 +1,109 @@
+import frappe
+
+
+ASSIGNMENT_DTYPE = "TEST Nursing Ward User"
+
+
+def get_current_ward(patient):
+    inpatient_records = frappe.get_all(
+        "Inpatient Record",
+        filters={
+            "patient": patient,
+            "status": "Admitted",
+        },
+        fields=["name"],
+        order_by="modified desc",
+        limit=1,
+    )
+
+    if not inpatient_records:
+        return None
+
+    inpatient_record = frappe.get_doc(
+        "Inpatient Record",
+        inpatient_records[0].name,
+    )
+
+    current_occupancy = None
+
+    for row in inpatient_record.inpatient_occupancies:
+        if not row.check_out:
+            current_occupancy = row
+            break
+
+    if not current_occupancy:
+        return None
+
+    bed = frappe.get_doc(
+        "Healthcare Service Unit",
+        current_occupancy.service_unit,
+    )
+
+    parent = bed.parent_healthcare_service_unit
+
+    while parent:
+        unit = frappe.get_doc(
+            "Healthcare Service Unit",
+            parent,
+        )
+
+        if unit.is_group:
+            return unit.name
+
+        parent = unit.parent_healthcare_service_unit
+
+    return None
+
+
+def get_ward_nurses(ward):
+    if not ward:
+        return []
+
+    return frappe.get_all(
+        ASSIGNMENT_DTYPE,
+        filters={"service_unit": ward},
+        pluck="user",
+    )
+
+
+def notify_ward_nurses_on_medication_request(doc, method=None):
+    if frappe.flags.in_import or frappe.flags.in_patch:
+        return
+
+    if doc.doctype != "Medication Request":
+        return
+
+    if doc.status != "completed-Medication Request Status":
+        return
+
+    ward = get_current_ward(doc.patient)
+
+    if not ward:
+        return
+
+    users = get_ward_nurses(ward)
+
+    if not users:
+        return
+
+    patient_name = doc.get("patient_name") or doc.patient
+
+    subject = f"دواء المريض {patient_name} جاهز للصرف"
+
+    message = (
+        f"دواء المريض <b>{patient_name}</b> جاهز للصرف من الصيدلية."
+    )
+
+    for user in users:
+        frappe.get_doc({
+            "doctype": "Notification Log",
+            "for_user": user,
+            "type": "Alert",
+            "document_type": doc.doctype,
+            "document_name": doc.name,
+            "subject": subject,
+            "email_content": message,
+        }).insert(ignore_permissions=True)
+
+    frappe.db.commit()
+
