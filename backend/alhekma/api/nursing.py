@@ -1,3 +1,5 @@
+import math
+
 import frappe
 from frappe import _
 
@@ -42,6 +44,189 @@ def _get_unit_tree_names(service_unit):
         },
         pluck="name",
     )
+
+
+def _parse_numeric(value, label):
+    if value is None or value == "":
+        return None
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        frappe.throw(_(f"{label} must be numeric."))
+
+    if not math.isfinite(number):
+        frappe.throw(_(f"{label} must be a finite number."))
+
+    return number
+
+
+@frappe.whitelist()
+def record_vital_signs(
+    inpatient_record,
+    temperature=None,
+    pulse=None,
+    respiratory_rate=None,
+    bp_systolic=None,
+    bp_diastolic=None,
+    spo2=None,
+    weight=None,
+    height=None,
+    vital_signs_note=None,
+):
+    """
+    Record and submit Vital Signs for a patient currently assigned
+    to the authenticated nurse's Healthcare Service Unit.
+
+    Authorization is intentionally enforced here because the current
+    hospital Nursing role does not have create/submit permission on
+    the standard Vital Signs DocType.
+    """
+
+    user = frappe.session.user
+
+    if not user or user == "Guest":
+        frappe.throw(_("Authentication required."), frappe.PermissionError)
+
+    if "Nursing" not in frappe.get_roles(user):
+        frappe.throw(_("Nursing access is required."), frappe.PermissionError)
+
+    presence = _get_active_presence(user)
+
+    if not presence:
+        frappe.throw(
+            _("No active staff shift presence was found."),
+            frappe.PermissionError,
+        )
+
+    service_unit = presence.healthcare_service_unit
+
+    if not service_unit:
+        frappe.throw(
+            _("Your active presence has no Healthcare Service Unit."),
+            frappe.PermissionError,
+        )
+
+    allowed_units = _get_unit_tree_names(service_unit)
+
+    inpatient = frappe.db.get_value(
+        "Inpatient Record",
+        inpatient_record,
+        ["name", "patient", "patient_name", "status"],
+        as_dict=True,
+    )
+
+    if not inpatient:
+        frappe.throw(_("Inpatient Record not found."))
+
+    if inpatient.status != "Admitted":
+        frappe.throw(_("Patient is not currently admitted."))
+
+    if not inpatient.patient:
+        frappe.throw(_("Inpatient Record has no linked Patient."))
+
+    occupancy_rows = frappe.get_all(
+        "Inpatient Occupancy",
+        filters={
+            "parent": inpatient_record,
+            "parenttype": "Inpatient Record",
+            "left": 0,
+        },
+        fields=["service_unit", "check_in", "check_out"],
+        order_by="check_in desc",
+        limit_page_length=20,
+    )
+
+    current_occupancy = next(
+        (row for row in occupancy_rows if row.service_unit in allowed_units),
+        None,
+    )
+
+    if not current_occupancy:
+        frappe.throw(
+            _("This patient is not currently assigned to your Healthcare Service Unit."),
+            frappe.PermissionError,
+        )
+
+    values = {
+        "temperature": _parse_numeric(temperature, _("Temperature")),
+        "pulse": _parse_numeric(pulse, _("Pulse")),
+        "respiratory_rate": _parse_numeric(
+            respiratory_rate, _("Respiratory rate")
+        ),
+        "bp_systolic": _parse_numeric(
+            bp_systolic, _("Systolic blood pressure")
+        ),
+        "bp_diastolic": _parse_numeric(
+            bp_diastolic, _("Diastolic blood pressure")
+        ),
+        "spo2": _parse_numeric(spo2, _("SpO₂")),
+        "weight": _parse_numeric(weight, _("Weight")),
+        "height": _parse_numeric(height, _("Height")),
+    }
+
+    if not any(value is not None for value in values.values()):
+        frappe.throw(_("At least one vital sign value is required."))
+
+    doc_values = {
+        "doctype": "Vital Signs",
+        "patient": inpatient.patient,
+        "inpatient_record": inpatient_record,
+        "signs_date": frappe.utils.today(),
+        "signs_time": frappe.utils.nowtime(),
+    }
+
+    for fieldname, value in values.items():
+        if value is None:
+            continue
+
+        if fieldname in {
+            "temperature",
+            "pulse",
+            "respiratory_rate",
+            "bp_systolic",
+            "bp_diastolic",
+        }:
+            doc_values[fieldname] = f"{value:g}"
+        else:
+            doc_values[fieldname] = value
+
+    if vital_signs_note not in (None, ""):
+        doc_values["vital_signs_note"] = str(vital_signs_note).strip()
+
+    doc = frappe.get_doc(doc_values)
+    doc.flags.ignore_permissions = True
+    doc.insert(ignore_permissions=True)
+    doc.submit()
+
+    frappe.db.commit()
+
+    return {
+        "message": "ok",
+        "vital_signs": {
+            "name": doc.name,
+            "owner": doc.owner,
+            "docstatus": doc.docstatus,
+            "patient": doc.patient,
+            "inpatient_record": doc.inpatient_record,
+            "service_unit": current_occupancy.service_unit,
+            "signs_date": doc.signs_date,
+            "signs_time": doc.signs_time,
+            "temperature": doc.temperature,
+            "pulse": doc.pulse,
+            "respiratory_rate": doc.respiratory_rate,
+            "bp_systolic": doc.bp_systolic,
+            "bp_diastolic": doc.bp_diastolic,
+            "spo2": doc.get("spo2"),
+            "weight": doc.weight,
+            "height": doc.height,
+        },
+    }
 
 
 @frappe.whitelist()
@@ -352,10 +537,8 @@ def get_patient_profile(inpatient_record):
             "temperature",
             "pulse",
             "respiratory_rate",
-            "systolic_bp",
-            "diastolic_bp",
-            "systolic_blood_pressure",
-            "diastolic_blood_pressure",
+            "bp_systolic",
+            "bp_diastolic",
             "weight",
             "height",
             "bmi",
@@ -369,11 +552,13 @@ def get_patient_profile(inpatient_record):
         ]
 
         if "patient" in vital_fields and safe_vital_fields:
-            order_field = (
-                "signs_date"
-                if "signs_date" in vital_fields
-                else "creation"
-            )
+            order_fields = []
+            if "signs_date" in vital_fields:
+                order_fields.append("signs_date desc")
+            if "signs_time" in vital_fields:
+                order_fields.append("signs_time desc")
+            order_fields.append("creation desc")
+            order_by = ", ".join(order_fields)
 
             vital_signs = frappe.get_all(
                 "Vital Signs",
@@ -381,7 +566,7 @@ def get_patient_profile(inpatient_record):
                     "patient": inpatient.patient,
                 },
                 fields=safe_vital_fields,
-                order_by=f"{order_field} desc, creation desc",
+                order_by=order_by,
                 limit_page_length=5,
             )
 
