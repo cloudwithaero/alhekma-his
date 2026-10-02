@@ -54,10 +54,8 @@ type Vital = {
   temperature?: number | string;
   pulse?: number | string;
   respiratory_rate?: number | string;
-  systolic_bp?: number | string;
-  diastolic_bp?: number | string;
-  systolic_blood_pressure?: number | string;
-  diastolic_blood_pressure?: number | string;
+  bp_systolic?: number | string;
+  bp_diastolic?: number | string;
   oxygen_saturation?: number | string;
   spo2?: number | string;
   weight?: number | string;
@@ -95,15 +93,15 @@ function formatDate(value?: string | null) {
 }
 
 function systolic(v: Vital) {
-  return v.systolic_bp ?? v.systolic_blood_pressure;
+  return v.bp_systolic;
 }
 
 function diastolic(v: Vital) {
-  return v.diastolic_bp ?? v.diastolic_blood_pressure;
+  return v.bp_diastolic;
 }
 
 function spo2(v: Vital) {
-  return v.oxygen_saturation ?? v.spo2;
+  return v.spo2;
 }
 
 function DataCard({
@@ -140,6 +138,19 @@ export default function PatientProfile({
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
+  const [savingVital, setSavingVital] = useState(false);
+  const [vitalMessage, setVitalMessage] = useState("");
+  const [vitalForm, setVitalForm] = useState({
+    temperature: "",
+    pulse: "",
+    respiratory_rate: "",
+    bp_systolic: "",
+    bp_diastolic: "",
+    spo2: "",
+    weight: "",
+    height: "",
+    vital_signs_note: "",
+  });
 
   async function loadProfile() {
     setError("");
@@ -182,6 +193,122 @@ export default function PatientProfile({
   useEffect(() => {
     void loadProfile();
   }, [inpatientRecordId]);
+
+  async function getCsrfToken(): Promise<string> {
+    const response = await fetch(
+      "/api/method/alhekma.api.badge_auth.get_csrf_token",
+      {
+        method: "GET",
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+        },
+      },
+    );
+
+    const data = await response.json();
+
+    if (!response.ok || !data?.message?.csrf_token) {
+      throw new Error("csrf_token_failed");
+    }
+
+    return data.message.csrf_token;
+  }
+
+  async function recordVitals() {
+    setVitalMessage("");
+
+    const values = Object.fromEntries(
+      Object.entries(vitalForm).filter(([, value]) => value.trim() !== ""),
+    );
+
+    const numericFields = [
+      "temperature",
+      "pulse",
+      "respiratory_rate",
+      "bp_systolic",
+      "bp_diastolic",
+      "spo2",
+      "weight",
+      "height",
+    ];
+
+    if (!numericFields.some((field) => values[field])) {
+      setVitalMessage("أدخل علامة حيوية واحدة على الأقل.");
+      return;
+    }
+
+    setSavingVital(true);
+
+    try {
+      const csrfToken = await getCsrfToken();
+
+      const response = await fetch(
+        "/api/method/alhekma.api.nursing.record_vital_signs",
+        {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+            "X-Frappe-CSRF-Token": csrfToken,
+          },
+          body: JSON.stringify({
+            inpatient_record: inpatientRecordId,
+            ...values,
+          }),
+        },
+      );
+
+      const data = await response.json();
+
+      if (!response.ok || data?.message?.message !== "ok") {
+        const message =
+          data?.message?.message ||
+          data?.message ||
+          data?.exception ||
+          "تعذر تسجيل العلامات الحيوية.";
+        throw new Error(
+          typeof message === "string"
+            ? message
+            : "تعذر تسجيل العلامات الحيوية.",
+        );
+      }
+
+      setVitalForm({
+        temperature: "",
+        pulse: "",
+        respiratory_rate: "",
+        bp_systolic: "",
+        bp_diastolic: "",
+        spo2: "",
+        weight: "",
+        height: "",
+        vital_signs_note: "",
+      });
+      setVitalMessage("تم تسجيل العلامات الحيوية واعتماد السجل بنجاح.");
+      await loadProfile();
+    } catch (err) {
+      setVitalMessage(
+        err instanceof Error
+          ? err.message
+          : "تعذر تسجيل العلامات الحيوية.",
+      );
+    } finally {
+      setSavingVital(false);
+    }
+  }
+
+  function updateVitalField(
+    field: keyof typeof vitalForm,
+    value: string,
+  ) {
+    setVitalForm((current) => ({
+      ...current,
+      [field]: value,
+    }));
+  }
+
 
   if (loading) {
     return (
@@ -347,6 +474,81 @@ export default function PatientProfile({
               icon={<CalendarDays className="size-5" />}
             />
           </div>
+        </section>
+
+        {/* Record vital signs */}
+        <section className="mt-5 rounded-3xl border bg-white p-6 shadow-sm">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <h2 className="font-bold">تسجيل العلامات الحيوية</h2>
+              <p className="mt-1 text-xs text-muted-foreground">
+                يتم حفظ القراءة باسم المستخدم الحالي ووقت التسجيل من الخادم.
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {[
+              ["temperature", "الحرارة (°C)", "0.1"],
+              ["pulse", "النبض /min", "1"],
+              ["respiratory_rate", "معدل التنفس /min", "1"],
+              ["bp_systolic", "ضغط انقباضي", "1"],
+              ["bp_diastolic", "ضغط انبساطي", "1"],
+              ["spo2", "SpO₂ (%)", "0.1"],
+              ["weight", "الوزن (kg)", "0.1"],
+              ["height", "الطول (m)", "0.01"],
+            ].map(([field, label, step]) => (
+              <label key={field} className="text-sm">
+                <span className="mb-1.5 block font-medium">{label}</span>
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  step={step}
+                  value={vitalForm[field as keyof typeof vitalForm]}
+                  onChange={(event) =>
+                    updateVitalField(
+                      field as keyof typeof vitalForm,
+                      event.target.value,
+                    )
+                  }
+                  className="w-full rounded-xl border bg-white px-3 py-2.5 outline-none focus:border-emerald-600"
+                />
+              </label>
+            ))}
+          </div>
+
+          <label className="mt-4 block text-sm">
+            <span className="mb-1.5 block font-medium">ملاحظات</span>
+            <textarea
+              value={vitalForm.vital_signs_note}
+              onChange={(event) =>
+                updateVitalField("vital_signs_note", event.target.value)
+              }
+              rows={3}
+              className="w-full rounded-xl border bg-white px-3 py-2.5 outline-none focus:border-emerald-600"
+            />
+          </label>
+
+          <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-xs text-muted-foreground">
+              لا توجد حدود أو تنبيهات إكلينيكية مضافة من الواجهة؛ التحقق هنا شكلي فقط بأن القيم رقمية.
+            </p>
+
+            <button
+              type="button"
+              disabled={savingVital}
+              onClick={() => void recordVitals()}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-700 px-5 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {savingVital ? "جاري الحفظ..." : "تسجيل Vital Signs"}
+            </button>
+          </div>
+
+          {vitalMessage ? (
+            <div className="mt-4 rounded-xl border bg-slate-50 px-4 py-3 text-sm">
+              {vitalMessage}
+            </div>
+          ) : null}
         </section>
 
         {/* Vital signs */}
